@@ -1,0 +1,7 @@
+*.pem
+*.key
+config.env
+*.env
+!config.example.env
+oci_config
+secrets/
