@@ -28,6 +28,7 @@ oc-reserve.sh --config config.env --dry-run   # everything except the launch
 sudo ./install.sh config.env                  # installs script + timer
 oc-reserve --status
 ```
+Notifications (only these three): first start, a daily summary at 08:00 America/Los_Angeles with the number of tries (until success), and success. Errors go to the log only (`/var/lib/oc-reserve/run.log`).
+
 Behaviour: each run checks for an existing instance of that name (idempotent), tries every
-region/shape/AD, treats "out of capacity" as normal, backs off on HTTP 429, alerts (max once per 6 h
-per error type) on real faults, and on success notifies, records state, and disables its own timer.
+region/shape/AD, treats "out of capacity" as normal, backs off on HTTP 429, logs real faults, and on success notifies, records state, and disables its own timer.

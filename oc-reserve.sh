@@ -46,13 +46,6 @@ notify() { # title, body, priority
   [ -n "$NTFY_TOPIC" ] || return 0
   curl -fsS -m 15 -H "Title: $1" -H "Priority: ${3:-default}" -d "$2" "$NTFY_SERVER/$NTFY_TOPIC" >/dev/null 2>&1 || true
 }
-# Notify on an error class at most once per 6h so a persistent config fault doesn't spam.
-notify_once() { # key, title, body
-  local f="$STATE_DIR/notified.$1" now; now=$(date +%s)
-  if [ -f "$f" ] && [ $((now - $(cat "$f"))) -lt 21600 ]; then return 0; fi
-  echo "$now" > "$f"; notify "$2" "$3" high
-}
-
 if [ "$STATUS" = 1 ]; then cat "$STATE_FILE" 2>/dev/null || echo "no state yet"; tail -5 "$LOG" 2>/dev/null; exit 0; fi
 if grep -q '^done' "$STATE_FILE" 2>/dev/null; then log "already succeeded; nothing to do"; exit 0; fi
 
@@ -63,10 +56,23 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
+# --- notifications: (1) first start, (2) daily summary 08:00 Pacific until success, (3) success ---
+if [ "$DRY_RUN" = 0 ]; then
+  if [ ! -f "$STATE_DIR/started" ]; then
+    date -u +%FT%TZ > "$STATE_DIR/started"; echo 0 > "$STATE_DIR/attempts"
+    notify "OC reserve started" "Watching for $INSTANCE_NAME ($SHAPES) in $REGIONS every ${INTERVAL_MINUTES:-?} min."
+  fi
+  la_date=$(TZ=America/Los_Angeles date +%F); la_hour=$(TZ=America/Los_Angeles date +%-H)
+  if [ "$la_hour" -ge 8 ] && [ "$(cat "$STATE_DIR/last_daily" 2>/dev/null)" != "$la_date" ]; then
+    echo "$la_date" > "$STATE_DIR/last_daily"
+    notify "OC reserve daily" "$(cat "$STATE_DIR/attempts") tries so far since $(cut -dT -f1 "$STATE_DIR/started"); no instance yet."
+  fi
+fi
+
 o() { oci "$@"; }
 TENANCY=$(awk -F= '/^tenancy=/{print $2; exit}' "$OCI_CONFIG_FILE")
 HOME_REGION=$(o iam region-subscription list --tenancy-id "$TENANCY" --query 'data[?"is-home-region"]|[0]."region-name"' --raw-output 2>/dev/null)
-[ -n "$HOME_REGION" ] || { log "auth or API failure reading home region"; notify_once auth "OC reserve: auth problem" "Cannot reach OCI with the configured API key. Check $CONFIG on the host."; exit 1; }
+[ -n "$HOME_REGION" ] || { log "auth or API failure reading home region"; log "hint: check API key in $CONFIG"; exit 1; }
 
 FREE_SHAPES_RE='^(VM\.Standard\.A1\.Flex|VM\.Standard\.E2\.1\.Micro)$'
 
@@ -108,6 +114,7 @@ ensure_subnet() { # region -> subnet id (reuse or create)
 try_launch() { # region ad shape ocpus mem subnet image -> 0 ok / 1 capacity-like / 2 fatal / 3 throttle
   local r="$1" ad="$2" shape="$3" ocpus="$4" mem="$5" sn="$6" img="$7" out rc cls
   if [ "$DRY_RUN" = 1 ]; then log "[$r][$ad] DRY-RUN would launch $shape ${ocpus:+$ocpus OCPU / $mem GB }image=${img:0:30}… subnet=${sn:0:30}…"; return 1; fi
+  echo $(( $(cat "$STATE_DIR/attempts" 2>/dev/null || echo 0) + 1 )) > "$STATE_DIR/attempts"
   local args=(compute instance launch --region "$r" -c "$COMPARTMENT_ID" --availability-domain "$ad"
     --shape "$shape" --image-id "$img" --subnet-id "$sn" --assign-public-ip true
     --display-name "$INSTANCE_NAME" --boot-volume-size-in-gbs "$BOOT_GB"
@@ -118,23 +125,23 @@ try_launch() { # region ad shape ocpus mem subnet image -> 0 ok / 1 capacity-lik
     local id; id=$(jq -r '.data.id' <<<"$out" 2>/dev/null)
     echo "done $(ts) region=$r ad=$ad shape=$shape id=$id" > "$STATE_FILE"
     log "SUCCESS [$r][$ad] $shape id=$id"
-    notify "OC instance CREATED" "$INSTANCE_NAME ($shape) created in $r. Public IP appears in the console in ~1 min." urgent
+    notify "OC instance CREATED" "$INSTANCE_NAME ($shape) created in $r after $(cat "$STATE_DIR/attempts" 2>/dev/null || echo 0) tries. Public IP appears in the console in ~1 min." urgent
     return 0
   fi
   cls=$(classify "$out"); log "[$r][$ad] $shape -> $cls"
   case "$cls" in
     capacity) return 1 ;;
     throttle) return 3 ;;
-    limit) notify_once limit "OC reserve: quota refused" "Launch refused by a quota/limit for $shape in $r. Needs a human: $(head -c 200 <<<"$out" | tr '\n' ' ')"; return 1 ;;
-    auth) notify_once auth "OC reserve: auth problem" "Launch refused as unauthorised in $r."; return 2 ;;
-    *) log "$(head -c 400 <<<"$out" | tr '\n' ' ')"; notify_once "other-$r" "OC reserve: unexpected error" "See $LOG on the host. $(head -c 160 <<<"$out" | tr '\n' ' ')"; return 1 ;;
+    limit) log "quota/limit refusal: $(head -c 300 <<<"$out" | tr '\n' ' ')"; return 1 ;;
+    auth) return 2 ;;
+    *) log "$(head -c 400 <<<"$out" | tr '\n' ' ')"; return 1 ;;
   esac
 }
 
 finish_success() {
   [ "$STOP_AFTER_SUCCESS" = true ] && [ -n "$TIMER_UNIT" ] && {
-    systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 || sudo -n systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 \
-      || notify "OC reserve: disable timer manually" "Instance created but I could not disable $TIMER_UNIT." high
+    systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1 || sudo -n systemctl disable --now "$TIMER_UNIT" >/dev/null 2>&1  \
+      || log "could not disable $TIMER_UNIT; disable it manually"
   }
 }
 
@@ -150,7 +157,7 @@ for r in "${REGION_LIST[@]}"; do
   ex=$(existing_instance "$r")
   if [ -n "$ex" ]; then
     log "[$r] instance '$INSTANCE_NAME' already exists ($ex) — marking done"
-    echo "done $(ts) region=$r existing id=$ex" > "$STATE_FILE"; finish_success; exit 0
+    echo "done $(ts) region=$r existing id=$ex" > "$STATE_FILE"; notify "OC instance CREATED" "$INSTANCE_NAME already exists in $r; nothing more to do." urgent; finish_success; exit 0
   fi
   sn=$(ensure_subnet "$r") || { log "[$r] network setup failed"; continue; }
   ads=$(o iam availability-domain list -c "$TENANCY" --region "$r" --query 'data[].name' 2>/dev/null | jq -r '.[]')
