@@ -120,7 +120,7 @@ try_launch() { # region ad shape ocpus mem subnet image -> 0 ok / 1 capacity-lik
     --display-name "$INSTANCE_NAME" --boot-volume-size-in-gbs "$BOOT_GB"
     --ssh-authorized-keys-file "$SSH_PUBKEY_FILE")
   [ -n "$ocpus" ] && args+=(--shape-config "{\"ocpus\":$ocpus,\"memoryInGBs\":$mem}")
-  out=$(o "${args[@]}" 2>&1); rc=$?
+  out=$(o --no-retry --connection-timeout 10 --read-timeout 60 "${args[@]}" 2>&1); rc=$?
   if [ $rc -eq 0 ]; then
     local id; id=$(jq -r '.data.id' <<<"$out" 2>/dev/null)
     echo "done $(ts) region=$r ad=$ad shape=$shape id=$id" > "$STATE_FILE"
